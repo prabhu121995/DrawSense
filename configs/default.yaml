@@ -1,0 +1,52 @@
+# TOTO ML Research - default experiment configuration.
+# Every experiment stores a full copy of the resolved config plus its hash,
+# so results are reproducible and comparable.
+config_version: "1.0.0"
+seed: 42
+
+data:
+  min_number: 1
+  max_number: 49
+  numbers_per_draw: 6
+
+features:
+  rolling_windows: [10, 20, 50, 100]
+  ewm_alphas: [0.05, 0.15]
+  context_window: 10          # window for odd/even & range-share context features
+  include_additional_history: true  # past additional-number frequency as a feature (past data only)
+
+split:
+  min_history: 30             # draws needed before the first feature row (warm-up)
+  test_fraction: 0.2          # untouched final chronological test set (last 20% of draws)
+  min_train_draws: 60         # first walk-forward validation origin needs this many training draws
+  refit_every: 10             # walk-forward: refit models every k validation draws
+
+calibration:
+  method: sigmoid             # sigmoid (Platt) | isotonic | none
+  n_bins: 10                  # reliability diagram / ECE bins (equal-mass)
+
+evaluation:
+  n_random_simulations: 2000  # repeated random rankings over exactly the same test draws
+  n_bootstrap: 2000
+  alpha: 0.05
+
+ensemble:
+  members: [frequency, ewm, logistic_regression, random_forest, extra_trees, xgboost, lightgbm, catboost, mlp]
+  method: rank_mean           # average per-draw percentile ranks
+
+tuning:
+  enabled: false              # Optuna tuning on pre-test data only
+  n_trials: 15
+  models: [lightgbm]
+
+models:
+  random: {}
+  frequency: {}
+  ewm: {alpha: 0.05}
+  logistic_regression: {C: 0.1, max_iter: 2000}
+  random_forest: {n_estimators: 200, max_depth: 6, min_samples_leaf: 50}
+  extra_trees: {n_estimators: 200, max_depth: 6, min_samples_leaf: 50}
+  xgboost: {n_estimators: 150, max_depth: 3, learning_rate: 0.05, subsample: 0.8, colsample_bytree: 0.8, reg_lambda: 5.0}
+  lightgbm: {n_estimators: 150, num_leaves: 8, learning_rate: 0.05, min_child_samples: 100, subsample: 0.8, subsample_freq: 1, colsample_bytree: 0.8, reg_lambda: 5.0}
+  catboost: {iterations: 200, depth: 4, learning_rate: 0.05, l2_leaf_reg: 10}
+  mlp: {hidden_layer_sizes: [32, 16], alpha: 0.01, max_iter: 300, early_stopping: true}

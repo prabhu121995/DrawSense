@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# DrawSense: trained model (rebuilt by notebook.ipynb) and temp files
+artifacts/
+.pytest_cache/
+*.tmp
