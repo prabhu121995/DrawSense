@@ -103,7 +103,10 @@ def _make_estimator(name: str, params: dict, seed: int):
         return LGBMClassifier(random_state=seed, n_jobs=N_JOBS, verbose=-1, **p)
     if name == "catboost":
         from catboost import CatBoostClassifier
-        return CatBoostClassifier(random_seed=seed, thread_count=N_JOBS, verbose=0,
+        # CatBoost results depend on the thread count, not only on the seed. A fixed thread_count from the
+        # config makes every retrain reproducible on any PC (default 1, see configs/default.yaml).
+        threads = p.pop("thread_count", N_JOBS)
+        return CatBoostClassifier(random_seed=seed, thread_count=threads, verbose=0,
                                   allow_writing_files=False, **p)
     if name == "mlp":
         if "hidden_layer_sizes" in p:

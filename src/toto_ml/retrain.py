@@ -34,23 +34,37 @@ def _now() -> float:
     return time.time()
 
 
+def _retry(fn, attempts: int = 60, delay: float = 0.05):
+    """Windows briefly locks a file while another process reads it (the app polls every 2 s); retry."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return _retry(lambda: json.loads(path.read_text(encoding="utf-8")))
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError):
+        return None
+
+
 def read_status(path: Path | None = None) -> dict:
     path = Path(path or STATUS_PATH)
-    try:
-        st = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    st = _read_json(path)
+    if st is None:
         return {"state": "idle"}
     if st.get("state") == "running":
         if _now() - st.get("heartbeat", 0) > STALE_AFTER_S:
             st["state"] = "failed"
             st["error"] = "The retrain process stopped unexpectedly (no heartbeat). Start it again."
         else:  # merge fine-grained progress written by the training cell (separate file: no write races)
-            try:
-                pr = json.loads(_progress_path(path).read_text(encoding="utf-8"))
-                if pr.get("t", 0) >= st.get("step_t", 0):
-                    st["progress"], st["detail"] = pr["progress"], pr["detail"]
-            except (FileNotFoundError, json.JSONDecodeError, KeyError):
-                pass
+            pr = _read_json(_progress_path(path))
+            if pr and "progress" in pr and pr.get("t", 0) >= st.get("step_t", 0):
+                st["progress"], st["detail"] = pr["progress"], pr.get("detail", "")
     return st
 
 
@@ -60,14 +74,22 @@ def _progress_path(status_path: Path) -> Path:
 
 def _write(path: Path, **fields) -> dict:
     with _lock:
-        st = read_status(path) if path.exists() else {}
+        st = _read_json(path) or {}  # raw file, not the display-adjusted read_status()
         st.update(fields)
         st["heartbeat"] = _now()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, default=str), encoding="utf-8")
-        os.replace(tmp, path)
+        _retry(lambda: tmp.write_text(json.dumps(st, default=str), encoding="utf-8"))
+        _retry(lambda: os.replace(tmp, path))
         return st
+
+
+def _safe_write(path: Path, **fields) -> None:
+    """Progress updates are cosmetic: they must never abort the training run."""
+    try:
+        _write(path, **fields)
+    except OSError:
+        pass
 
 
 def is_running(path: Path | None = None) -> bool:
@@ -154,7 +176,7 @@ def _run() -> int:
         step = headings.get(cell_index, "")
         if cell_index == train_idx:
             step = "Training & benchmarking all algorithms"
-        _write(path, progress=round(prog, 4), step=step, detail=f"cell {cell_index + 1}/{n}", step_t=_now())
+        _safe_write(path, progress=round(prog, 4), step=step, detail=f"cell {cell_index + 1}/{n}", step_t=_now())
 
     client = NotebookClient(nb, timeout=3600, kernel_name="python3",
                             resources={"metadata": {"path": str(PROJECT_ROOT)}}, on_cell_start=on_start)
@@ -169,7 +191,7 @@ def _run() -> int:
         return 0
     except Exception as e:  # noqa: BLE001 - report every failure to the UI
         msg = str(e)
-        _write(path, state="failed", finished_at=_now(), error=msg[-3000:], step="Failed")
+        _safe_write(path, state="failed", finished_at=_now(), error=msg[-3000:], step="Failed")
         print(msg, file=sys.stderr)
         return 1
     finally:
