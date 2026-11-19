@@ -1,12 +1,15 @@
 # DrawSense
 
-Ranks Singapore Pools TOTO numbers with machine learning and shows the **next 5 ranked six-number sets**.
-You add each new draw result as it comes out; training happens in a Jupyter notebook that picks the best algorithm.
+Ranks Singapore Pools TOTO numbers with machine learning and shows the **top 5 ranked six-number sets**
+for the next draw.
 
 ```
-Add results (Save draw) ──> toto_results.csv ──> notebook.ipynb (retrain, pick best) ──> next 5 ranked sets
-                            (appended)            artifacts/best_model/                   (shown right away)
+once:        notebook.ipynb ──> benchmarks 11 algorithms, picks the best (CatBoost) ──> artifacts/best_model/
+every draw:  Save draw ──> toto_results.csv ──> quick refit of CatBoost (seconds) ──> top 5 sets
 ```
+
+The full benchmark runs once (or occasionally). After that DrawSense predicts from the saved model. When you
+add a new draw, it only refits the chosen model on all draws, which takes a few seconds.
 
 > TOTO draws are random. Every six-number set has the same 1 in 13,983,816 chance of winning Group 1, and every
 > number a 6/49 = 12.245% chance. The notebook tests honestly whether any model beats random selection on draws
@@ -29,23 +32,26 @@ uv run streamlit run app.py          # opens DrawSense at http://localhost:8501
 winning numbers and the additional number, then click **Save draw**. DrawSense:
 1. checks the draw (6 different numbers in 1–49, additional not one of them, new date);
 2. appends it to `toto_results.csv` in the file's own format (`Thu, 19 Nov 2026`; prize columns blank);
-3. retrains by re-running `notebook.ipynb` (about 2–3 minutes);
-4. shows the next 5 ranked sets for the following draw.
+3. updates the model: refits CatBoost on all draws with the same settings (a few seconds, no re-benchmark);
+4. shows the top 5 ranked sets for the following draw.
 
-Untick "Retrain and predict…" to only save. You can also upload a CSV/XLSX: only dates not stored yet are added.
-**Fix a mistake** deletes the latest draw. Before the first change, a one-time copy of the original file is
-saved as `toto_results.backup.csv`.
+Untick "Update the model…" to only save. You can also upload a CSV/XLSX: only dates not stored yet are added,
+then the model is updated. **Fix a mistake** deletes the latest draw. Before the first change, a one-time copy
+of the original file is saved as `toto_results.backup.csv`.
 
-**Next sets tab:** the next draw date (Monday/Thursday), the 5 ranked sets (1–10 configurable), all 49 numbers
-with calibrated probabilities, and a CSV download. A note appears when draws were added after the model was
-trained: those draws are already used as history, and retraining makes the model learn from them too.
+**Next sets tab:** the next draw date (Monday/Thursday), the top 5 ranked sets (1–10 configurable), all 49
+numbers with calibrated probabilities, and a CSV download.
 
-**Model tab:** the chosen algorithm, how it did on unseen test draws vs random, all algorithms' test results,
-and a **Retrain now** button that re-runs `notebook.ipynb` on all stored draws (about 3 minutes).
+**Model tab:** the chosen algorithm, how it did on unseen test draws vs random, and all algorithms' test results.
+- **Update model** is only enabled when `toto_results.csv` has draws the model has not learned yet.
+- **Full benchmark (occasional)** re-runs `notebook.ipynb` to re-test all 11 algorithms and pick the best again
+  (about 3 minutes). It runs in the background with a progress bar at the top of the page, and refreshing the
+  page doesn't stop it. Run it only when you want to re-check the algorithm choice, for example after many new
+  draws. The quick update keeps the test evidence and calibration from the last full benchmark.
 
 ## Training notebook
 
-`notebook.ipynb` (run it in VS Code/Jupyter with the `.venv` kernel, or via the Retrain button):
+`notebook.ipynb` (run it once in VS Code/Jupyter with the `.venv` kernel, or via **Full benchmark**):
 1. loads `toto_results.csv` (8 columns only) and validates it;
 2. builds features for each number from earlier draws only (frequencies over 10/20/50/100 draws, weighted
    recency, gaps since last seen, pair co-occurrence, odd/even, ranges, previous-draw context);
@@ -71,7 +77,7 @@ Headless: `uv run jupyter nbconvert --to notebook --execute --inplace notebook.i
 ## Command line
 
 ```powershell
-uv run toto-ml predict                                    # print the next 5 ranked sets
+uv run toto-ml predict                                    # print the top 5 ranked sets
 uv run toto-ml add 2026-11-19 3 8 17 25 40 49 --additional 11   # add a draw result
 uv run toto-ml api                                        # optional JSON API, docs at http://127.0.0.1:8000/docs
 ```

@@ -54,6 +54,23 @@ def test_predict_next_five_ranked_sets(artifact, synth_draws):
     assert r["based_on"]["last_draw_date"] == synth_draws["draw_date"].iloc[-1].strftime("%Y-%m-%d")
 
 
+def test_refit_updates_model_with_new_draws_without_rebenchmarking(artifact, synth_draws, tmp_path):
+    from toto_ml.artifact import refit
+    from toto_ml.data import validate_and_clean
+    b = load_artifact(artifact[0])
+    more, _, _ = validate_and_clean(generate_synthetic_draws(185, seed=3))  # same 180 draws + 5 new ones
+    assert more["draw_date"].iloc[:180].tolist() == synth_draws["draw_date"].tolist()
+    new = refit(b, more, out_dir=tmp_path)
+    assert new["model_name"] == b["model_name"]                       # same algorithm, no re-selection
+    assert new["metadata"]["training_data"]["n_draws"] == 185
+    assert new["metadata"]["last_update"]["new_draws"] == 5
+    assert new["metadata"]["test_significance"] == b["metadata"]["test_significance"]  # evidence kept
+    assert new["calibrator"] is not None
+    reloaded = load_artifact(tmp_path)
+    r = predict_next(reloaded)                                        # history.csv now has 185 draws
+    assert r["based_on"]["n_draws"] == 185 and len(r["sets"]) == 5   # default: top 5 sets
+
+
 def test_ranked_sets_diversity():
     rng = np.random.default_rng(0)
     p = rng.uniform(0.1, 0.14, 49)

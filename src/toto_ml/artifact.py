@@ -25,7 +25,7 @@ from .config import BASELINE_P, PROJECT_ROOT, config_hash
 from .data.schema import REQUIRED_COLS
 from .evaluation.metrics import EXPECTED
 from .features import build_features
-from .models import LABELS, rank_mean_ensemble
+from .models import LABELS, make_scorer, rank_mean_ensemble
 from .prediction import JACKPOT_ODDS, number_history_stats, rank_numbers, ranked_sets
 
 DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts" / "best_model"
@@ -121,6 +121,49 @@ def load_artifact(path: str | Path = DEFAULT_ARTIFACT_DIR) -> dict:
     bundle = joblib.load(f)
     bundle["dir"] = f.parent
     return bundle
+
+
+def refit(bundle: dict, draws: pd.DataFrame, out_dir: str | Path | None = None) -> dict:
+    """Quick update after new draws: refit the SAME chosen algorithm (same settings, same seed) on all draws.
+
+    No re-benchmarking and no algorithm re-selection (that is what notebook.ipynb does). The probability
+    calibrator and the test evidence are kept from the last full notebook run. Takes seconds, not minutes.
+    """
+    out = Path(out_dir or bundle.get("dir") or DEFAULT_ARTIFACT_DIR)
+    cfg = bundle["config"]
+    meta = dict(bundle["metadata"])
+    fs = build_features(draws, cfg)
+    if fs.feature_names != meta["feature_names"]:
+        raise ValueError("Feature set changed since the last notebook run. Run the full notebook instead.")
+    labelled = fs.frame[fs.frame["t"] < fs.T]
+    scorers = {}
+    for name, sc in bundle["scorers"].items():
+        if getattr(sc, "needs_fit", False):
+            scorers[name] = make_scorer(name, cfg, fs.feature_names, sc.params).fit(labelled)
+        else:  # frequency-type baselines have nothing to fit; they read the features directly
+            scorers[name] = sc
+    dates = pd.to_datetime(draws["draw_date"])
+    prev_n = meta["training_data"]["n_draws"]
+    meta.setdefault("benchmark_created_at", meta["created_at"])
+    meta["created_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta["training_data"] = {"n_draws": int(len(draws)), "date_min": dates.min().strftime("%Y-%m-%d"),
+                             "date_max": dates.max().strftime("%Y-%m-%d")}
+    meta["last_update"] = {"type": "refit", "previous_n_draws": prev_n, "new_draws": int(len(draws) - prev_n),
+                           "note": f"{meta['best_model_label']} refitted on all draws with the same settings. "
+                                   "Algorithm choice and test evidence are from the last full notebook run "
+                                   f"({meta['benchmark_created_at']})."}
+    new = {k: v for k, v in bundle.items() if k != "dir"}
+    new.update(scorers=scorers, metadata=meta)
+    out.mkdir(parents=True, exist_ok=True)
+    tmp = out / "model.joblib.tmp"
+    joblib.dump(new, tmp, compress=3)
+    tmp.replace(out / "model.joblib")
+    (out / "metadata.json").write_text(json.dumps(meta, indent=2, default=float), encoding="utf-8")
+    hist = draws.copy()
+    hist["draw_date"] = dates.dt.strftime("%Y-%m-%d")
+    hist[REQUIRED_COLS].to_csv(out / "history.csv", index=False)
+    new["dir"] = out
+    return new
 
 
 def load_history(bundle: dict) -> pd.DataFrame:
