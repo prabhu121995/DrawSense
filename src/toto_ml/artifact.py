@@ -5,7 +5,10 @@ The notebook (notebook.ipynb) trains & benchmarks every algorithm, calls
 ``load_artifact`` and ``predict_next``; they never train.
 
 Artifact folder layout (default ``artifacts/best_model/``):
-    model.joblib      fitted scorer(s) + calibrator + config (everything needed to predict)
+    model.joblib      fitted scorers + calibrators + config (everything needed to predict):
+                        scorers / calibrator              trained on 100% of draws (refitted after new draws)
+                        split_scorers / split_calibrator  trained on the development split only (before the
+                                                          final test period), frozen until the next notebook run
     metadata.json     selection rule, chosen model, leaderboards, significance, training range
     leaderboard.csv   validation & test metrics for all algorithms
     history.csv       the draws the model was trained on (draw_date, n1..n6, additional)
@@ -27,6 +30,7 @@ from .evaluation.metrics import EXPECTED
 from .features import build_features
 from .models import LABELS, make_scorer, rank_mean_ensemble
 from .prediction import JACKPOT_ODDS, number_history_stats, rank_numbers, ranked_sets
+from .value import fit_popularity, number_popularity, shape_profile, value_sets
 
 DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts" / "best_model"
 SELECTION_METRIC = "log_loss"   # proper scoring rule over all 49 probabilities: least noisy choice
@@ -60,8 +64,11 @@ def save_artifact(res, best: str, draws: pd.DataFrame, out_dir: str | Path = DEF
     out.mkdir(parents=True, exist_ok=True)
     o = res.outputs[best]
     members = o.params.get("members") if best == "ensemble" else None
-    scorers = ({m: res.outputs[m].production_scorer for m in members} if members
-               else {best: o.production_scorer})
+    names = members or [best]
+    scorers = {m: res.outputs[m].production_scorer for m in names}   # 100% of draws
+    split_scorers = {m: res.outputs[m].final_scorer for m in names}  # development split only (tested model)
+    label = (f"Ensemble ({' + '.join(LABELS.get(m, m) for m in members)})" if members
+             else LABELS.get(best, best))
     sp = res.split
     dates = pd.to_datetime(draws["draw_date"])
     sig = res.significance["models"].get(best, {})
@@ -73,11 +80,13 @@ def save_artifact(res, best: str, draws: pd.DataFrame, out_dir: str | Path = DEF
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "config_hash": res.config_hash,
         "best_model": best,
-        "best_model_label": LABELS.get(best, best),
+        "best_model_label": label,
         "ensemble_members": members,
         "selection": {"metric": SELECTION_METRIC, "split": SELECTION_SPLIT,
-                      "rule": f"lowest {SELECTION_METRIC} on the development walk-forward period "
-                              "(random baseline excluded); the final test period is NOT used for selection"},
+                      "rule": ("a fixed choice in configs/default.yaml (live.model); the final test period is "
+                               "only used to report its result" if best == res.cfg.get("live", {}).get("model") else
+                               f"lowest {SELECTION_METRIC} on the development walk-forward period "
+                               "(random baseline excluded); the final test period is NOT used for selection")},
         "training_data": {"n_draws": int(len(draws)), "date_min": dates.min().strftime("%Y-%m-%d"),
                           "date_max": dates.max().strftime("%Y-%m-%d")},
         "validation_period": {"from": dates.iloc[sp.val_start].strftime("%Y-%m-%d"),
@@ -101,7 +110,8 @@ def save_artifact(res, best: str, draws: pd.DataFrame, out_dir: str | Path = DEF
         "feature_names": res.features.feature_names,
     }
     bundle = {"model_name": best, "members": members, "scorers": scorers,
-              "calibrator": o.production_calibrator, "config": res.cfg, "metadata": meta}
+              "calibrator": o.production_calibrator, "split_scorers": split_scorers,
+              "split_calibrator": o.calibrator, "popularity": fit_popularity(), "config": res.cfg, "metadata": meta}
     joblib.dump(bundle, out / "model.joblib", compress=3)
     (out / "metadata.json").write_text(json.dumps(meta, indent=2, default=float), encoding="utf-8")
     leaderboard_frame(res).to_csv(out / "leaderboard.csv", index=False)
@@ -125,6 +135,9 @@ def load_artifact(path: str | Path = DEFAULT_ARTIFACT_DIR) -> dict:
 
 def refit(bundle: dict, draws: pd.DataFrame, out_dir: str | Path | None = None) -> dict:
     """Quick update after new draws: refit the SAME chosen algorithm (same settings, same seed) on all draws.
+
+    Only the 100% model is refitted. The split model stays as trained on the development split, so its
+    sets keep matching the test evidence; it still scores the next draw from the latest history.
 
     No re-benchmarking and no algorithm re-selection (that is what notebook.ipynb does). The probability
     calibrator and the test evidence are kept from the last full notebook run. Takes seconds, not minutes.
@@ -153,7 +166,7 @@ def refit(bundle: dict, draws: pd.DataFrame, out_dir: str | Path | None = None) 
                                    "Algorithm choice and test evidence are from the last full notebook run "
                                    f"({meta['benchmark_created_at']})."}
     new = {k: v for k, v in bundle.items() if k != "dir"}
-    new.update(scorers=scorers, metadata=meta)
+    new.update(scorers=scorers, metadata=meta, popularity=fit_popularity())
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / "model.joblib.tmp"
     joblib.dump(new, tmp, compress=3)
@@ -179,21 +192,60 @@ def next_draw_date(last: date) -> date:
     return d
 
 
-def predict_next(bundle: dict, draws: pd.DataFrame | None = None, n_sets: int = 5, pool: int = 12,
-                 max_overlap: int = 3, window: int = 20) -> dict:
-    """Score all 49 numbers for the draw after the last one in ``draws`` and build ranked sets."""
+def _score(scorers: dict, calibrator, live: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Raw scores (rank-mean over members for an ensemble) and calibrated probabilities for 49 numbers."""
+    if len(scorers) > 1:
+        scores = rank_mean_ensemble({m: s.score(live) for m, s in scorers.items()}, live["t"].to_numpy())
+    else:
+        scores = next(iter(scorers.values())).score(live)
+    return scores, calibrator.transform(scores)
+
+
+def predict_next(bundle: dict, draws: pd.DataFrame | None = None, n_split: int | None = None,
+                 n_full: int | None = None, pool: int | None = None, max_overlap: int = 3, window: int = 20,
+                 strategy: str | None = None) -> dict:
+    """Score all 49 numbers for the draw after the last one in ``draws`` and build ranked sets.
+
+    ``n_split`` sets come from the model trained on the development split, then ``n_full`` sets from the
+    model trained on 100% of draws (defaults: ``live`` in the config, 2 + 2). A full-data set shares at
+    most ``max_overlap`` numbers with any set before it. Artifacts without a split model give full sets only.
+
+    ``strategy`` (config ``live.strategy``): "value" builds sets from the model's top ``pool`` numbers in a
+    typical draw shape, ordered by prize value (fewer players share a win); "model" uses the model ranking only.
+    """
     draws = load_history(bundle) if draws is None else draws
     cfg = bundle["config"]
+    live_cfg = cfg.get("live", {})
+    n_split = int(live_cfg.get("sets_split", 2) if n_split is None else n_split)
+    n_full = int(live_cfg.get("sets_full", 2) if n_full is None else n_full)
+    if not bundle.get("split_scorers"):
+        n_full, n_split = n_full + n_split, 0
+    strategy = strategy or live_cfg.get("strategy", "value")
+    pool = int(pool or live_cfg.get("pool", 18 if strategy == "value" else 12))
+    pop = bundle.get("popularity") or fit_popularity()
+    prof = shape_profile(draws)
+
+    def build(p, sc, n, earlier):
+        if strategy == "value":
+            return value_sets(p, sc, pop, prof, n_sets=n, pool=pool, max_overlap=max_overlap, seed=seed,
+                              earlier=earlier)
+        return ranked_sets(p, sc, n_sets=n, pool=pool, max_overlap=max_overlap, seed=seed, earlier=earlier)
     fs = build_features(draws, cfg)
     live = fs.rows_for_states([fs.T])
-    if bundle["members"]:
-        scores = rank_mean_ensemble({m: s.score(live) for m, s in bundle["scorers"].items()}, live["t"].to_numpy())
-    else:
-        scores = bundle["scorers"][bundle["model_name"]].score(live)
-    probs = bundle["calibrator"].transform(scores)
     seed = int(cfg["seed"])
+    scores, probs = _score(bundle["scorers"], bundle["calibrator"], live)
+    sets = []
+    if n_split:
+        s_scores, s_probs = _score(bundle["split_scorers"], bundle["split_calibrator"], live)
+        sets += [{**s, "source": "split"} for s in build(s_probs, s_scores, n_split, [])]
+    if n_full:
+        sets += [{**s, "source": "full"} for s in build(probs, scores, n_full, [x["numbers"] for x in sets])]
+    for r, s in enumerate(sets, start=1):
+        s["source_rank"] = s["rank"]
+        s["rank"] = r
     order = rank_numbers(probs, scores, seed)
     hist = number_history_stats(draws, window).set_index("number")
+    popn = number_popularity(pop).set_index("number")
     numbers = []
     for r, i in enumerate(order, start=1):
         n = int(i) + 1
@@ -201,6 +253,7 @@ def predict_next(bundle: dict, draws: pd.DataFrame | None = None, n_sets: int = 
         numbers.append({"rank": r, "number": n, "probability": float(probs[i]), "score": float(scores[i]),
                         "hist_freq": float(h["hist_freq"]), "recent_count": int(h["recent_count"]),
                         "recent_window": int(h["recent_window"]), "last_seen_date": h["last_seen_date"],
+                        "value_pct": float(popn.loc[n, "value_pct"]),
                         "draws_since_last": None if pd.isna(h["draws_since_last"]) else int(h["draws_since_last"])})
     last = pd.to_datetime(draws["draw_date"]).iloc[-1].date()
     last_row = draws.iloc[-1]
@@ -212,11 +265,16 @@ def predict_next(bundle: dict, draws: pd.DataFrame | None = None, n_sets: int = 
                      "last_numbers": [int(last_row[f"n{k}"]) for k in range(1, 7)],
                      "last_additional": int(last_row["additional"])},
         "next_draw_date": next_draw_date(last).isoformat(),
-        "sets": ranked_sets(probs, scores, n_sets=n_sets, pool=pool, max_overlap=max_overlap, seed=seed),
+        "sets": sets,
+        "strategy": strategy,
+        "popularity": {k: v for k, v in pop.items() if k != "weights"},
+        "shape": prof,
+        "sources": {"split": "trained on the development split (draws before the final test), the tested model",
+                    "full": "trained on 100% of draws (refitted when new draws are added)"},
         "numbers": numbers,
         "prob_sum": float(probs.sum()),
         "evidence": meta["test_significance"],
-        "disclaimer": (f"TOTO draws are random. Every set has the same 1 in {JACKPOT_ODDS:,} chance of winning "
-                       "Group 1; rankings are model estimates, not better odds."),
+        "disclaimer": (f"Fair play verified: every set has the same 1 in {JACKPOT_ODDS:,} chance of winning Group 1. "
+                       "DrawSense builds sets for prize value, so a winning set shares its prize with fewer people."),
         "config_hash": config_hash(cfg),
     }

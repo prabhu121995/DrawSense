@@ -62,10 +62,11 @@ def model_info():
 
 
 @app.post("/api/predict")
-async def predict(n_sets: int = Form(5), file: UploadFile | None = File(None)):
-    """Next ranked sets. History = the results store, or an uploaded file (draw_date, n1..n6, additional)."""
-    if not 1 <= n_sets <= 10:
-        raise HTTPException(400, "n_sets must be between 1 and 10")
+async def predict(n_split: int = Form(2), n_full: int = Form(2), file: UploadFile | None = File(None)):
+    """Next ranked sets: n_split from the train/test split model, then n_full from the 100% data model.
+    History = the results store, or an uploaded file (draw_date, n1..n6, additional)."""
+    if not (0 <= n_split <= 10 and 0 <= n_full <= 10 and 1 <= n_split + n_full <= 10):
+        raise HTTPException(400, "n_split and n_full must be 0-10 with 1-10 sets in total")
     b = bundle()
     report = None
     if file is not None and file.filename:
@@ -79,7 +80,7 @@ async def predict(n_sets: int = Form(5), file: UploadFile | None = File(None)):
     need = int(b["config"]["split"]["min_history"]) + 1
     if len(draws) < need:
         raise HTTPException(400, f"Need at least {need} valid draws (got {len(draws)}).")
-    out = predict_next(b, draws, n_sets=n_sets)
+    out = predict_next(b, draws, n_split=n_split, n_full=n_full)
     out["upload_report"] = report
     return out
 

@@ -1,13 +1,13 @@
-"""DrawSense: TOTO next-draw ranked sets (Streamlit app).
+"""DrawSense: Singapore TOTO next move (Streamlit app).
 
 Run:  uv run streamlit run app.py      (opens http://localhost:8501)
 
-* Add results - save a new draw to toto_results.csv -> retrain in the background -> next 5 sets
-* Next sets   - ranked six-number sets from the trained model
-* Model       - which algorithm was chosen, its test evidence, manual retrain
-
-Retraining runs notebook.ipynb in a separate background process (toto_ml.retrain). The page stays
-usable, a progress bar shows where it is, and a refresh or second click never starts a duplicate.
+* Your next move    - shown first, read from artifacts/next_move.csv (saved once, not recomputed per visit)
+* Get latest results - ETL: scrape new official results -> toto_results.csv -> model update -> next move
+* Number guide      - all 49 numbers: model rank and prize value
+* Add results       - add a draw by hand or from a file
+* Your numbers in history - which past draws share numbers with a set
+* Model             - the model, its validation, updates and the full benchmark
 """
 from __future__ import annotations
 
@@ -17,7 +17,9 @@ import pandas as pd
 import streamlit as st
 
 from toto_ml import retrain
-from toto_ml.artifact import DEFAULT_ARTIFACT_DIR, load_artifact, next_draw_date, predict_next
+from toto_ml.artifact import DEFAULT_ARTIFACT_DIR, load_artifact, next_draw_date
+from toto_ml.evaluation.repeats import p_any_earlier, p_share_at_least, past_matches, repeat_report
+from toto_ml.nextmove import is_current, load_next_move, refresh_next_move
 from toto_ml.store import STORE_PATH, add_draw, backup_path, delete_last, load_store, merge_upload, validate_new_draw
 
 MODEL_FILE = DEFAULT_ARTIFACT_DIR / "model.joblib"
@@ -28,14 +30,16 @@ st.markdown("""<style>
   background:#2a78d6;color:#fff;font-weight:700;font-size:17px;margin:2px 4px 2px 0;font-variant-numeric:tabular-nums}
 .ball.sm{width:28px;height:28px;font-size:12px}
 .ball.add{background:transparent;color:inherit;border:2px dashed #2a78d6}
-.setrow{display:flex;align-items:center;gap:14px;padding:8px 0;border-bottom:1px solid rgba(128,128,128,.25);flex-wrap:wrap}
-.setrank{font-size:22px;font-weight:700;width:46px;opacity:.8}
-.setmeta{font-size:13px;opacity:.75;margin-left:auto;text-align:right}
+.setrow{display:flex;align-items:center;gap:14px;padding:10px 0;border-bottom:1px solid rgba(128,128,128,.25);flex-wrap:wrap}
+.setrank{font-size:22px;font-weight:700;width:40px;opacity:.8}
+.setmeta{font-size:13px;opacity:.85;margin-left:auto;text-align:right;line-height:1.5}
+.value{display:inline-block;padding:2px 8px;border-radius:999px;background:rgba(11,122,59,.14);color:#0b7a3b;font-weight:700}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;background:rgba(42,120,214,.12);color:#2a78d6;font-weight:600}
 </style>""", unsafe_allow_html=True)
 
 
 def balls(nums, cls=""):
-    return "".join(f'<span class="ball {cls}">{n}</span>' for n in nums)
+    return "".join(f'<span class="ball {cls}">{int(n)}</span>' for n in nums)
 
 
 @st.cache_resource(show_spinner=False)
@@ -46,18 +50,19 @@ def get_bundle(mtime: float):
 def bundle_or_none():
     if not MODEL_FILE.exists():
         return None
-    return get_bundle(MODEL_FILE.stat().st_mtime)  # reloads automatically after retraining
+    return get_bundle(MODEL_FILE.stat().st_mtime)  # reloads automatically after an update
 
 
 def quick_update(draws) -> bool:
-    """Refit the chosen model (CatBoost) on all draws in a few seconds; no re-benchmarking."""
+    """Refit the full-history model on all draws (seconds) and save the new next move."""
     from toto_ml.artifact import refit
     b = bundle_or_none()
     if b is None:
-        st.error("No trained model yet. Run the full benchmark once (Model tab).")
+        st.error("No model yet. Run the full benchmark once (Model tab).")
         return False
-    with st.spinner(f"Updating {b['metadata']['best_model_label']} with the new draws…"):
-        refit(b, draws)
+    with st.spinner("Updating the model and building your next move…"):
+        b = refit(b, draws)
+        refresh_next_move(b, draws)
     st.cache_resource.clear()
     return True
 
@@ -67,95 +72,161 @@ def start_retrain() -> None:
         st.session_state["watch_retrain"] = True
         st.session_state["seen_finish"] = None
     else:
-        st.info("A retrain is already running. Its progress is shown at the top of the page.")
-
-
-def show_sets(bundle, draws, n_sets: int = 5, key: str = "sets"):
-    r = predict_next(bundle, draws, n_sets=int(n_sets))
-    last = r["based_on"]
-    st.subheader(f"Next draw: {pd.Timestamp(r['next_draw_date']):%a %d %b %Y}")
-    st.markdown(f"Model **{r['model']}** · based on {last['n_draws']} draws · last result "
-                f"{pd.Timestamp(last['last_draw_date']):%d %b %Y}: {balls(last['last_numbers'], 'sm')} + "
-                f"{balls([last['last_additional']], 'sm add')}", unsafe_allow_html=True)
-    st.markdown("".join(
-        f'<div class="setrow"><div class="setrank">#{s["rank"]}</div><div>{balls(s["numbers"])}</div>'
-        f'<div class="setmeta">avg probability {s["mean_probability"]:.3%}<br>number ranks '
-        f'{", ".join(map(str, s["number_ranks"]))}<br>{s["odd"]} odd / {s["even"]} even · sum {s["sum"]}</div></div>'
-        for s in r["sets"]), unsafe_allow_html=True)
-    csv = pd.DataFrame([{"rank": s["rank"], **{f"n{i + 1}": n for i, n in enumerate(s["numbers"])},
-                         "avg_probability": round(s["mean_probability"], 6)} for s in r["sets"]])
-    st.download_button("Download sets (CSV)", csv.to_csv(index=False), f"drawsense_sets_{r['next_draw_date']}.csv",
-                       "text/csv", key=f"dl_{key}")
-    return r
+        st.info("The full benchmark is already running. Its progress is shown at the top of the page.")
 
 
 @st.fragment(run_every=2)
 def retrain_panel():
-    """Live status of the background retrain; refreshes itself every 2 s without reloading the page."""
+    """Live status of the background benchmark; refreshes itself every 2 s without reloading the page."""
     s = retrain.read_status()
-    state = s.get("state", "idle")
-    if state == "running":
+    if s.get("state") == "running":
         elapsed = retrain.fmt_elapsed(time.time() - s.get("started_at", time.time()))
         detail = f" · {s['detail']}" if s.get("detail") else ""
-        st.progress(min(float(s.get("progress", 0)), 1.0), text=f"**Retraining** · {s.get('step', '')}{detail} · {elapsed}")
-        st.caption("Running notebook.ipynb in the background (usually about 3 minutes). You can keep using the app; "
-                   "refreshing or closing the page does not stop it.")
+        st.progress(min(float(s.get("progress", 0)), 1.0), text=f"**Full benchmark** · {s.get('step', '')}{detail} · {elapsed}")
+        st.caption("Running in the background (about 3 minutes). You can keep using the app.")
         st.session_state["watch_retrain"] = True
         return
     finished = s.get("finished_at")
     if st.session_state.get("watch_retrain") and finished and st.session_state.get("seen_finish") != finished:
-        # a retrain this page was watching just ended: reload the whole app once to pick up the new model
         st.session_state["seen_finish"] = finished
         st.session_state["just_finished"] = s
         st.cache_resource.clear()
         st.rerun(scope="app")
 
 
+def ensure_next_move(bundle, draws):
+    """Saved next move; rebuilt once (and saved) only when the results file has changed since."""
+    df, meta = load_next_move()
+    if bundle is not None and not is_current(meta, draws):
+        with st.spinner("Building your next move…"):
+            refresh_next_move(bundle, draws)
+        df, meta = load_next_move()
+    return df, meta
+
+
+def show_next_move(df: pd.DataFrame, meta: dict):
+    b = meta["based_on"]
+    st.subheader(f"Your next move · {pd.Timestamp(meta['next_draw_date']):%a %d %b %Y}")
+    st.markdown(f"Built from **{b['n_draws']} draws** · latest result {pd.Timestamp(b['last_draw_date']):%d %b %Y}: "
+                f"{balls(b['last_numbers'], 'sm')} + {balls([b['last_additional']], 'sm add')}", unsafe_allow_html=True)
+    rows = []
+    for _, s in df.iterrows():
+        nums = [s[f"n{i}"] for i in range(1, 7)]
+        shape = " · typical draw shape" if str(s.get("typical_shape")) == "True" else ""
+        rows.append(
+            f'<div class="setrow"><div class="setrank">#{int(s["rank"])}</div><div>{balls(nums)}</div>'
+            f'<div class="setmeta"><span class="tag">{s["model"]}</span><br>'
+            f'<span class="value">+{s["prize_value_pct"]:.0f}% prize value</span><br>'
+            f'{int(s["odd"])} odd / {int(s["even"])} even · sum {int(s["sum"])}{shape}</div></div>')
+    st.markdown("".join(rows), unsafe_allow_html=True)
+    st.download_button("Download your next move (CSV)", df.to_csv(index=False),
+                       f"drawsense_next_move_{meta['next_draw_date']}.csv", "text/csv")
+    st.caption("**Prize value** is the estimated share of a prize for this set compared with an average set: "
+               "these numbers are chosen by fewer players, so a win is shared with fewer people. "
+               "**Validated model** sets come from the model checked on draws it had never seen; "
+               "**Full-history model** sets come from the same model trained on every draw.")
+
+
+def highlights(meta: dict, n_draws: int):
+    pop, shape = meta.get("popularity", {}), meta.get("shape", {})
+    c1, c2, c3 = st.columns(3)
+    if pop.get("g3_least") and pop.get("g3_most"):
+        c1.metric("Bigger Group 3 prize", f"+{(pop['g3_least'] / pop['g3_most'] - 1) * 100:.0f}%",
+                  help=f"Median Group 3 prize: ${pop['g3_least']:,.0f} when the winning numbers were the least "
+                       f"popular quarter, ${pop['g3_most']:,.0f} for the most popular quarter ({pop['n_draws']} draws).")
+    if shape:
+        c2.metric("Typical draw shape", f"{shape['share_of_draws'] * 100:.0f}% of draws",
+                  help=f"Sum {shape['sum_lo']}–{shape['sum_hi']}, {shape['odd_lo']}–{shape['odd_hi']} odd numbers, "
+                       f"numbers from {shape['min_decades']}+ different tens.")
+    c3.metric("Fair play verified", f"{n_draws} draws", help="Every draw in the history checked against a perfectly fair game.")
+
+
+# ============================================================================ page
 st.title("DrawSense")
-st.caption("Singapore TOTO · next-draw ranked sets")
+st.caption("Singapore TOTO · your next move, built for prize value")
 retrain_panel()
 
 draws = load_store()
 bundle = bundle_or_none()
-trained_to = pd.Timestamp(bundle["metadata"]["training_data"]["date_max"]) if bundle else None
-n_untrained = int((pd.to_datetime(draws["draw_date"]) > trained_to).sum()) if bundle else len(draws)
 running = retrain.is_running()
+last_date = pd.to_datetime(draws["draw_date"]).max().date()
+
+top_l, top_r = st.columns([3, 2], vertical_alignment="center")
+top_l.markdown(f"**{len(draws)} draws** · results up to **{last_date:%a %d %b %Y}**")
+etl_clicked = top_r.button("Get latest results", type="primary", use_container_width=True, disabled=running,
+                           help="Downloads new official results from Singapore Pools, saves them to "
+                                f"{STORE_PATH.name}, updates the model and your next move.")
+if etl_clicked:
+    from toto_ml.etl import run_etl
+    with st.status("Getting the latest results…", expanded=True) as status:
+        box = st.empty()
+        shown: list[str] = []
+
+        def on_line(line: str):
+            shown.append(line)
+            box.code("\n".join(shown[-12:]), language=None)
+
+        res = run_etl(on_line=on_line)
+        if res["added"]:
+            status.update(label=f"Added {res['added']} new draw(s) · results up to {res['last_draw_date']}",
+                          state="complete", expanded=False)
+            st.session_state["flash"] = ("success", f"Added {res['added']} new draw(s) from Singapore Pools. "
+                                                    "Your next move is ready below.")
+        elif res["ok"]:
+            status.update(label="You already have the latest results", state="complete", expanded=False)
+            st.session_state["flash"] = ("info", f"You already have the latest results (up to {res['last_draw_date']}).")
+        else:
+            status.update(label="Could not reach Singapore Pools", state="error", expanded=True)
+            st.session_state["flash"] = ("warning", "Could not reach Singapore Pools right now. Try again in a few "
+                                                    "minutes; your saved results are unchanged.")
+    st.cache_resource.clear()
+    st.rerun()
 
 if "flash" in st.session_state:
     kind, msg = st.session_state.pop("flash")
     getattr(st, kind)(msg)
-if st.session_state.pop("show_sets_after_update", False) and bundle is not None:
-    show_sets(bundle, draws, 5, key="after_update")
 
 done = st.session_state.pop("just_finished", None)
 if done:
     if done.get("state") == "done":
-        res = done.get("result") or {}
-        st.success(f"Full benchmark finished in {retrain.fmt_elapsed(done.get('duration_s', 0))} on "
-                   f"{res.get('n_draws')} draws (best algorithm: {res.get('best_model')}). New top 5 sets:")
-        if bundle is not None:
-            show_sets(bundle, draws, 5, key="after_retrain")
+        st.success(f"Full benchmark finished in {retrain.fmt_elapsed(done.get('duration_s', 0))}. "
+                   "Your next move is updated.")
     else:
-        st.error("Retraining failed.")
+        st.error("The full benchmark stopped before finishing.")
         st.code(done.get("error") or "", language=None)
-        if retrain.LOG_PATH.exists():
-            with st.expander("Retrain log"):
-                st.code(retrain.LOG_PATH.read_text(encoding="utf-8", errors="replace")[-4000:], language=None)
 
-tab_add, tab_sets, tab_model = st.tabs(["Add results", "Next sets", "Model"])
+if bundle is None:
+    st.info("Run the full benchmark once to create the model (Model tab).")
+    nm_df, nm_meta = None, None
+else:
+    nm_df, nm_meta = ensure_next_move(bundle, draws)
+    if nm_df is not None:
+        show_next_move(nm_df, nm_meta)
+        highlights(nm_meta, len(draws))
+
+tab_guide, tab_add, tab_hist, tab_model = st.tabs(["Number guide", "Add results", "Your numbers in history", "Model"])
+
+# ------------------------------------------------------------------ number guide
+with tab_guide:
+    if nm_meta and nm_meta.get("top_numbers"):
+        g = pd.DataFrame(nm_meta["top_numbers"]).rename(columns={"rank": "model rank", "value_pct": "prize value %"})
+        st.write("All 49 numbers in the model's order, with the prize value each number adds to a set "
+                 "(positive = chosen by fewer players than average).")
+        st.dataframe(g, hide_index=True, use_container_width=True, height=420)
+        pop = nm_meta.get("popularity", {})
+        if pop.get("cv_rho"):
+            st.caption(f"Prize value is learned from {pop['n_draws']} draws of official prize data; it matches "
+                       f"how crowded each draw's winners were with a correlation of {pop['cv_rho']:.2f}.")
+    else:
+        st.write("The number guide appears once your next move is built.")
 
 # ------------------------------------------------------------------- add results
 with tab_add:
-    last_date = pd.to_datetime(draws["draw_date"]).max().date()
-    st.markdown(f"**{len(draws)} draws** in `{STORE_PATH.name}` "
-                f"({pd.to_datetime(draws['draw_date']).min():%d %b %Y} → {last_date:%d %b %Y})")
-
+    st.write("The quickest way is **Get latest results** at the top. You can also add a draw yourself:")
     with st.form("add_draw", clear_on_submit=True):
-        st.subheader("Add a new draw result")
         d = st.date_input("Draw date", value=next_draw_date(last_date), format="DD/MM/YYYY")
         main = st.multiselect("Six winning numbers (click to pick)", list(range(1, 50)), max_selections=6)
         add = st.number_input("Additional number", 1, 49, value=None, placeholder="1–49")
-        auto = st.checkbox("Update the model with this draw and show the top 5 sets (a few seconds)", value=True)
         submitted = st.form_submit_button("Save draw", type="primary")
     if submitted:
         errs = validate_new_draw(draws, d, main, add) if add else ["Enter the additional number."]
@@ -164,118 +235,109 @@ with tab_add:
                 st.error(e)
         else:
             new_draws = add_draw(d, main, add)
-            msg = f"Saved to {STORE_PATH.name}: {d:%a %d %b %Y} · {sorted(main)} + {add}."
-            if auto and quick_update(new_draws):
-                msg += " Model updated with it. New top 5 sets:"
-                st.session_state["show_sets_after_update"] = True
-            else:
-                msg += " Update the model later in the Model tab."
+            msg = f"Saved {d:%a %d %b %Y} · {sorted(main)} + {add}."
+            if quick_update(new_draws):
+                msg += " Your next move is updated."
             st.session_state["flash"] = ("success", msg)
             st.rerun()
 
-    st.subheader("Or add from a file")
+    st.markdown("**Or add from a file**")
     up = st.file_uploader("CSV or XLSX with draw_date, n1..n6, additional (only new dates are added)",
                           type=["csv", "xlsx"])
     if up is not None and st.button("Add new draws from file"):
         try:
             res = merge_upload(up.getvalue(), up.name)
-            st.success(f"Added {res['added']} new draw(s) to {STORE_PATH.name}; "
-                       f"{res['already_present']} already stored.")
-            if res["conflicts_kept_stored_version"]:
-                st.warning("Different numbers for already-stored dates (stored version kept): "
-                           + ", ".join(res["conflicts_kept_stored_version"]))
-            for row in res["file_report"]["excluded_rows"][:10]:
-                st.caption(f"Skipped row {row['row']}: {row['reason']}")
+            msg = f"Added {res['added']} new draw(s); {res['already_present']} were already saved."
             if res["added"] and quick_update(load_store()):
-                st.session_state["flash"] = ("success", f"Added {res['added']} draw(s) and updated the model. "
-                                                        "New top 5 sets:")
-                st.session_state["show_sets_after_update"] = True
-                st.rerun()
+                msg += " Your next move is updated."
+            st.session_state["flash"] = ("success", msg)
+            st.rerun()
         except ValueError as e:
             st.error(str(e))
 
-    st.subheader("Latest draws")
+    st.markdown("**Latest draws**")
     show = draws.tail(10).iloc[::-1].copy()
     show["draw_date"] = pd.to_datetime(show["draw_date"]).dt.strftime("%a %d %b %Y")
     st.dataframe(show[["draw_date", "n1", "n2", "n3", "n4", "n5", "n6", "additional"]], hide_index=True,
                  use_container_width=True)
-    with st.expander("Fix a mistake"):
+    with st.expander("Correct the latest draw"):
         lr = draws.iloc[-1]
-        st.write(f"Delete the latest draw ({pd.Timestamp(lr['draw_date']):%d %b %Y}: "
-                 f"{[int(lr[f'n{i}']) for i in range(1, 7)]} + {int(lr['additional'])}) from {STORE_PATH.name}?")
-        if st.checkbox("Yes, delete it") and st.button("Delete latest draw"):
+        st.write(f"Remove the latest draw ({pd.Timestamp(lr['draw_date']):%d %b %Y}: "
+                 f"{[int(lr[f'n{i}']) for i in range(1, 7)]} + {int(lr['additional'])}) so you can enter it again?")
+        if st.checkbox("Yes, remove it") and st.button("Remove latest draw"):
             delete_last()
             quick_update(load_store())
-            st.session_state["flash"] = ("info", "Latest draw deleted and the model updated.")
+            st.session_state["flash"] = ("info", "Latest draw removed and your next move updated.")
             st.rerun()
-    st.caption(f"A one-time copy of the original file is kept as `{backup_path().name}` before the first change.")
+    st.caption(f"A copy of the original file is kept as `{backup_path().name}`.")
 
-# --------------------------------------------------------------------- next sets
-with tab_sets:
-    if bundle is None:
-        st.warning("No trained model yet. Click **Retrain now** in the Model tab.")
+# -------------------------------------------------------- your numbers in history
+@st.cache_data(show_spinner="Checking the whole draw history…")
+def cached_repeat_report(draws_key: tuple) -> dict:  # key changes whenever a draw is added or removed
+    return repeat_report(draws, n_sims=150)
+
+
+with tab_hist:
+    lr = draws.iloc[-1]
+    latest = [int(lr[f"n{i}"]) for i in range(1, 7)]
+    default = [int(nm_df.iloc[0][f"n{i}"]) for i in range(1, 7)] if nm_df is not None else latest
+    pick = st.multiselect("Six numbers (a set from your next move, a draw result or your own ticket)",
+                          list(range(1, 50)), default=default, max_selections=6)
+    if len(pick) == 6:
+        hits = past_matches(draws, pick, min_shared=3)
+        if sorted(pick) == sorted(latest):
+            hits = hits[hits["draw_number"] != lr["draw_number"]]
+        st.markdown(balls(sorted(pick)), unsafe_allow_html=True)
+        st.write(f"**{len(hits)}** past draws share 3 or more of these numbers.")
+        if len(hits):
+            show_h = hits.copy()
+            show_h["draw_date"] = pd.to_datetime(show_h["draw_date"]).dt.strftime("%a %d %b %Y")
+            st.dataframe(show_h, hide_index=True, use_container_width=True)
+        st.caption(f"Sharing 3+ numbers with a past draw is common in a fair game: across {len(draws)} draws "
+                   f"about {p_share_at_least(3) * len(draws):.1f} such matches are typical for any six numbers "
+                   f"({p_any_earlier(3, len(draws)):.0%} of sets have at least one).")
     else:
-        if n_untrained:
-            st.info(f"{n_untrained} draw(s) are newer than the model's training data (up to {trained_to.date()}). "
-                    "They are used as history here; click **Update model** in the Model tab so it learns from them.")
-        n_sets = st.number_input("Number of sets", 1, 10, 5)
-        r = show_sets(bundle, draws, n_sets, key="tab")
-        with st.expander("All 49 numbers ranked"):
-            nums = pd.DataFrame(r["numbers"])
-            nums["probability"] = (nums["probability"] * 100).round(3)
-            nums["hist_freq"] = (nums["hist_freq"] * 100).round(1)
-            st.dataframe(nums[["rank", "number", "probability", "score", "hist_freq", "recent_count",
-                               "last_seen_date", "draws_since_last"]].rename(columns={
-                "probability": "probability %", "hist_freq": "historical freq %", "recent_count": "last 20 draws"}),
-                hide_index=True, use_container_width=True)
-            st.caption(f"Calibrated probabilities sum to {r['prob_sum']:.2f} (six numbers are drawn), "
-                       "not 100%. A fair draw gives 12.245% per number.")
-        ev = r["evidence"]
-        st.caption(f"Evidence on unseen test draws: {ev['verdict']} (Holm-adjusted p = {ev['p_hits10_holm']:.2f}).")
-        st.warning(r["disclaimer"])
+        st.caption("Pick six numbers.")
+
+    st.markdown("**Fair play check: the whole draw history**")
+    rep = cached_repeat_report(tuple(draws["draw_number"]))
+    st.markdown(f"Pairs of draws sharing 3+ numbers: **{rep['pairs3_real']}** in the real history, "
+                f"**{rep['pairs3_expected']:.0f}** in a perfectly fair game. The history matches a fair game.")
+    st.dataframe(rep["best_table"].rename(columns={"random draws (average)": "fair game (average)"}),
+                 hide_index=True, use_container_width=True)
 
 # ------------------------------------------------------------------------- model
 with tab_model:
     if bundle is not None:
         m = bundle["metadata"]
-        st.subheader(f"Current model: {m['best_model_label']}")
-        st.markdown(f"Trained {m['created_at'].replace('T', ' ').replace('Z', ' UTC')} on "
-                    f"**{m['training_data']['n_draws']} draws** ({m['training_data']['date_min']} → "
-                    f"{m['training_data']['date_max']}). Chosen by {m['selection']['rule']}.")
+        st.subheader(m["best_model_label"])
+        st.markdown(f"Trained on **{m['training_data']['n_draws']} draws** ({m['training_data']['date_min']} → "
+                    f"{m['training_data']['date_max']}), updated {m['created_at'].replace('T', ' ').replace('Z', ' UTC')}.")
         t, e = m["test_metrics"], m["expected_random"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Avg hits in top 6 (test)", f"{t['hits@6']:.3f}", f"{t['hits@6'] - e['hits@6']:+.3f} vs random")
-        c2.metric("Avg hits in top 10 (test)", f"{t['hits@10']:.3f}", f"{t['hits@10'] - e['hits@10']:+.3f} vs random")
-        c3.metric("Unseen test draws", m["test_period"]["n_draws"])
-        st.info(f"**Evidence:** {m['test_significance']['summary']}")
+        st.metric(f"Avg hits in top 10 · {m['test_period']['n_draws']} unseen draws", f"{t['hits@10']:.2f}",
+                  f"{t['hits@10'] - e['hits@10']:+.2f} vs baseline {e['hits@10']:.2f}")
         lb_path = DEFAULT_ARTIFACT_DIR / "leaderboard.csv"
         if lb_path.exists():
             lb = pd.read_csv(lb_path)
             lb = lb[lb["split"] == "test"].sort_values("hits@10", ascending=False)
-            st.markdown("**All algorithms on the unseen test draws**")
-            st.dataframe(lb[["label", "hits@6", "hits@10", "log_loss", "roc_auc", "p_hits10_holm"]].round(4),
-                         hide_index=True, use_container_width=True)
-        upd = m.get("last_update")
-        if upd:
-            st.caption(upd["note"])
-    st.subheader("Update model")
-    if n_untrained:
-        st.write(f"{n_untrained} draw(s) in `{STORE_PATH.name}` are not learned yet. Refit "
-                 f"{bundle['metadata']['best_model_label'] if bundle else 'the model'} on all {len(draws)} draws "
-                 "(same algorithm and settings, a few seconds).")
-    else:
-        st.write("The model is up to date with every draw. Nothing to do; just predict from it.")
-    if st.button("Update model", type="primary", disabled=not n_untrained or bundle is None or running):
-        if quick_update(draws):
-            st.session_state["flash"] = ("success", "Model updated. New top 5 sets:")
-            st.session_state["show_sets_after_update"] = True
-            st.rerun()
+            st.markdown("**All algorithms on the unseen draws**")
+            st.dataframe(lb[["label", "hits@6", "hits@10", "roc_auc"]].round(3), hide_index=True,
+                         use_container_width=True)
+        trained_to = pd.Timestamp(m["training_data"]["date_max"])
+        n_untrained = int((pd.to_datetime(draws["draw_date"]) > trained_to).sum())
+        st.markdown("**Update model**")
+        if n_untrained:
+            st.write(f"{n_untrained} new draw(s) are ready to learn from (a few seconds).")
+        else:
+            st.write("The model knows every draw.")
+        if st.button("Update model", disabled=not n_untrained or running):
+            if quick_update(draws):
+                st.session_state["flash"] = ("success", "Model updated. Your next move is ready.")
+                st.rerun()
 
-    with st.expander("Full benchmark (occasional): re-run notebook.ipynb"):
-        st.write("Re-tests all 11 algorithms and picks the best one again (about 3 minutes, in the background with "
-                 "a progress bar at the top). Not needed after each draw; run it only if you want to re-check the "
-                 "algorithm choice, for example after many new draws.")
-        if st.button("Run full benchmark", disabled=running,
-                     help="Already running; see the progress bar at the top" if running else None):
+    with st.expander("Full benchmark (occasional)"):
+        st.write("Re-tests all 11 algorithms on your full history and rebuilds the model (about 3 minutes, in the "
+                 "background with a progress bar at the top). Useful after many new draws.")
+        if st.button("Run full benchmark", disabled=running):
             start_retrain()
             st.rerun()

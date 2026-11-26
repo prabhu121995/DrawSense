@@ -31,8 +31,16 @@ evaluation:
   alpha: 0.05
 
 ensemble:
-  members: [frequency, ewm, logistic_regression, random_forest, extra_trees, xgboost, lightgbm, catboost, mlp]
+  members: [xgboost, random_forest]   # the live model: rank-average of XGBoost and Random Forest
   method: rank_mean           # average per-draw percentile ranks
+
+live:
+  model: ensemble             # exported by the notebook (fixed choice; the leaderboard is still reported)
+  sets_split: 2               # sets from the model trained on the development split (tested on the final test)
+  sets_full: 2                # sets from the same model trained on 100% of draws
+  strategy: value             # value: sets from the model's top numbers, typical shape, fewest co-winners
+                              # model: plain model ranking
+  pool: 18                    # how many top-ranked numbers the sets are built from
 
 tuning:
   enabled: false              # Optuna tuning on pre-test data only

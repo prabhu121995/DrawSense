@@ -18,13 +18,16 @@ Output CSV columns:
 
 Usage:
   pip install requests beautifulsoup4
-  python toto_scraper.py                       # all draws in the official list
+  python toto_scraper.py                       # only new draws since last run
+  python toto_scraper.py --full                # all draws in the official list
   python toto_scraper.py --start 3800 --end 4100
   python toto_scraper.py --latest 50
   python toto_scraper.py --debug 4000          # save raw HTML for one draw
 
-Already-scraped draws in the output CSV are skipped, so you can stop and
-re-run safely. Always compare a sample with the official site before relying
+Incremental by default: if the output CSV exists, the scraper reads the last
+draw number/date in it and only fetches draws after that. Use --full to scan
+the whole official list and fill any gaps. Already-scraped draws are always
+skipped, so you can stop and re-run safely. Always compare a sample with the official site before relying
 on the data.
 """
 
@@ -36,6 +39,7 @@ import random
 import re
 import sys
 import time
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -233,6 +237,29 @@ def load_done(path):
         return {r["draw_number"] for r in csv.DictReader(f) if r.get("draw_number")}
 
 
+def parse_date(text):
+    """'Mon, 20 Nov 2023' -> date, or None if it can't be parsed."""
+    text = (text or "").strip()
+    for fmt in ("%a, %d %b %Y", "%d %b %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def load_last(path):
+    """Return (last_draw_number, last_draw_date_text) from the CSV, or (None, None)."""
+    if not os.path.exists(path):
+        return None, None
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if (r.get("draw_number") or "").isdigit()]
+    if not rows:
+        return None, None
+    last = max(rows, key=lambda r: int(r["draw_number"]))
+    return int(last["draw_number"]), last.get("draw_date", "")
+
+
 def append_row(path, row):
     new = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -263,6 +290,9 @@ def main():
     ap.add_argument("--start", type=int, help="first draw number")
     ap.add_argument("--end", type=int, help="last draw number")
     ap.add_argument("--latest", type=int, help="only the N most recent draws")
+    ap.add_argument("--full", action="store_true",
+                    help="check the whole draw list (fill gaps), not just draws "
+                         "after the last one in the CSV")
     ap.add_argument("--delay", type=float, default=1.5, help="seconds between requests")
     ap.add_argument("--debug", type=int, metavar="DRAW",
                     help="fetch one draw, save raw HTML, print parsed result")
@@ -283,43 +313,102 @@ def main():
         print(parse_draw(html, args.debug))
         return
 
+    done = load_done(args.output)
+    last_num, last_date_txt = load_last(args.output)
+    last_date = parse_date(last_date_txt)
+    # Incremental mode: only draws after the last one already in the CSV.
+    # Disabled when the user asks for an explicit range or --full.
+    incremental = (last_num is not None and not args.full
+                   and not (args.start or args.end or args.latest))
+    if last_num is not None:
+        print(f"Last draw in {args.output}: #{last_num} ({last_date_txt or 'no date'})")
+    if incremental:
+        print(f"Incremental mode: only draws after #{last_num}"
+              + (f" / {last_date:%d %b %Y}" if last_date else "")
+              + " (use --full to re-check the whole list)")
+
     print("Fetching draw list ...")
     draws = get_draw_list(session)
     if draws:
         print(f"  {len(draws)} draws in official list "
               f"(#{min(d[0] for d in draws)} - #{max(d[0] for d in draws)})")
+    elif incremental:
+        # Probe forward from the last saved draw; stop at the first missing one.
+        print("  Draw list unavailable; probing draws after the last saved one.")
+        draws = None
     else:
         print("  Draw list unavailable; falling back to --start/--end range.")
         if not (args.start and args.end):
             sys.exit("Provide --start and --end when the draw list can't be fetched.")
         draws = [(n, sppl_for(n)) for n in range(args.end, args.start - 1, -1)]
 
-    if args.start:
-        draws = [d for d in draws if d[0] >= args.start]
-    if args.end:
-        draws = [d for d in draws if d[0] <= args.end]
-    draws.sort(key=lambda d: d[0], reverse=True)
-    if args.latest:
-        draws = draws[: args.latest]
+    if draws is not None:
+        if incremental:
+            draws = [d for d in draws if d[0] > last_num]
+        if args.start:
+            draws = [d for d in draws if d[0] >= args.start]
+        if args.end:
+            draws = [d for d in draws if d[0] <= args.end]
+        draws.sort(key=lambda d: d[0], reverse=True)
+        if args.latest:
+            draws = draws[: args.latest]
+        todo = [d for d in draws if str(d[0]) not in done]
+        # Oldest first, so the CSV grows in date order and a stop mid-run
+        # leaves no gap before the next incremental run.
+        if incremental:
+            todo.sort(key=lambda d: d[0])
+    else:
+        todo = []
 
-    done = load_done(args.output)
-    todo = [d for d in draws if str(d[0]) not in done]
-    print(f"{len(todo)} draws to fetch ({len(done)} already in {args.output})")
+    if draws is not None and not todo:
+        print("Already up to date - no new draws to fetch.")
+        return
+    if draws is not None:
+        print(f"{len(todo)} draws to fetch ({len(done)} already in {args.output})")
+
+    def save(row, label):
+        append_row(args.output, row)
+        nums = " ".join(row[f"n{k}"] for k in range(1, 7))
+        print(f"{label} #{row['draw_number']} {row['draw_date']}: "
+              f"{nums} + {row['additional']}")
+
+    def is_new(row):
+        """In incremental mode, also guard on the draw date."""
+        if not incremental or not last_date:
+            return True
+        d = parse_date(row.get("draw_date"))
+        return d is None or d > last_date
 
     ok = failed = 0
-    for i, (num, sppl) in enumerate(todo, 1):
-        html = fetch(session, DRAW_URL.format(sppl=sppl))
-        row = parse_draw(html, num) if html else None
-        if row:
-            append_row(args.output, row)
+    if draws is None:
+        num = last_num + 1
+        while True:
+            html = fetch(session, DRAW_URL.format(sppl=sppl_for(num)))
+            row = parse_draw(html, num) if html else None
+            if not row or row["draw_number"] != str(num) or not is_new(row):
+                break
+            save(row, "[new]")
             ok += 1
-            nums = " ".join(row[f"n{k}"] for k in range(1, 7))
-            print(f"[{i}/{len(todo)}] #{row['draw_number']} {row['draw_date']}: "
-                  f"{nums} + {row['additional']}")
-        else:
-            failed += 1
-            print(f"[{i}/{len(todo)}] #{num}: no parseable result - skipped")
-        time.sleep(args.delay + random.random() * 0.5)
+            num += 1
+            time.sleep(args.delay + random.random() * 0.5)
+        if ok == 0:
+            print("Already up to date - no new draws found.")
+            return
+    else:
+        for i, (num, sppl) in enumerate(todo, 1):
+            html = fetch(session, DRAW_URL.format(sppl=sppl))
+            row = parse_draw(html, num) if html else None
+            if row and is_new(row):
+                save(row, f"[{i}/{len(todo)}]")
+                ok += 1
+            elif row:
+                print(f"[{i}/{len(todo)}] #{num}: dated {row['draw_date']}, "
+                      f"not after {last_date_txt} - skipped")
+                failed += 1
+            else:
+                failed += 1
+                print(f"[{i}/{len(todo)}] #{num}: no parseable result - skipped")
+            time.sleep(args.delay + random.random() * 0.5)
 
     sort_csv(args.output)
     print(f"\nDone. {ok} saved, {failed} skipped. Output: {args.output}")
