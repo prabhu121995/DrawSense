@@ -84,9 +84,30 @@ def test_etl_adds_new_rows_and_replaces_hand_typed_row(tmp_path, monkeypatch):
         print("[1/2] #4025 saved")
     '''), encoding="utf-8")
     monkeypatch.setattr(etl, "SCRAPER", fake)
+    fake4d = tmp_path / "fake_4d.py"
+    fake4d.write_text(textwrap.dedent('''
+        import sys
+        out = sys.argv[sys.argv.index("-o") + 1]
+        cols = ["draw_number", "draw_date", "first", "second", "third"] + [f"starter_{i}" for i in range(1, 11)]
+        cols += [f"consolation_{i}" for i in range(1, 11)]
+        nums = [f"{i:04d}" for i in range(3, 23)]
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(",".join(cols) + chr(10))
+            f.write(",".join(["5566", '"Wed, 25 Nov 2026"', "8064", "2112", "0018"] + nums) + chr(10))
+        print("4D [1/1] #5566 saved")
+    '''), encoding="utf-8")
+    monkeypatch.setattr(etl, "FOURD_SCRAPER", fake4d)
     lines = []
-    res = etl.run_etl(csv, on_line=lines.append, update_model=False)
+    dbf = tmp_path / "drawsense.db"
+    res = etl.run_etl(csv, on_line=lines.append, update_model=False, fourd_path=tmp_path / "fourd.csv", db_path=dbf)
     assert res["ok"] and res["added"] == 1 and res["merged_manual_rows"] == 1
+    assert res["fourd"] == {"ok": True, "added": 1, "n_draws": 1, "last_draw_date": "2026-11-25"}
+    from toto_ml import db
+    s = db.summary(dbf).set_index("game")
+    assert s.loc["toto", "draws"] == 27 and s.loc["4d", "draws"] == 1          # both games in one database
+    third = db.query("SELECT number, root, axis, mirror FROM draw_numbers WHERE game='4d' AND prize='3rd'", db_path=dbf)
+    assert third.iloc[0].tolist() == ["0018", 9, "5563", "8100"]              # leading zeros kept
+    assert len(db.etl_history(db_path=dbf)) == 2
     raw = pd.read_csv(csv)
     jan26 = raw[raw["draw_date"] == "Mon, 26 Jan 2024"]
     assert len(jan26) == 1 and int(jan26["draw_number"].iloc[0]) == 4025 and int(jan26["n6"].iloc[0]) == 8

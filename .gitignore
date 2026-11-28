@@ -13,3 +13,8 @@ wheels/
 artifacts/
 .pytest_cache/
 *.tmp
+
+# DrawSense database: rebuilt from toto_results.csv + fourd_results.csv by the ETL (toto-ml db)
+*.db
+*.db-journal
+debug_4d_*.html

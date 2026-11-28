@@ -4,7 +4,10 @@
     toto-ml predict [--split 2 --full 2]           print the next ranked sets (split model + 100% model)
     toto-ml add 2026-11-19 1 2 3 4 5 6 --additional 7   add a new draw result
     toto-ml api [--port 8000]                      optional JSON API
-    toto-ml etl                                    get the latest results from the web, update model + next move
+    toto-ml etl                                    get the latest TOTO + 4D results, save both to drawsense.db,
+                                                   update the TOTO model + next move
+    toto-ml db                                     rebuild drawsense.db from toto_results.csv + fourd_results.csv
+    toto-ml fourd-sets                             4D-inspired TOTO sets from the last three 4D draws + backtest
 
 Training is done in notebook.ipynb.
 """
@@ -29,7 +32,10 @@ def main(argv=None) -> int:
     s.add_argument("date", help="YYYY-MM-DD")
     s.add_argument("numbers", nargs=6, type=int)
     s.add_argument("--additional", type=int, required=True)
-    sub.add_parser("etl")
+    s = sub.add_parser("etl")
+    s.add_argument("--no-4d", action="store_true", help="TOTO only")
+    sub.add_parser("db")
+    sub.add_parser("fourd-sets")
     s = sub.add_parser("api")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8000)
@@ -45,12 +51,39 @@ def main(argv=None) -> int:
 
     if args.cmd == "etl":
         from .etl import run_etl
-        res = run_etl(on_line=print)
-        print(f"\n{res['added']} new draw(s); {res['n_draws']} draws up to {res['last_draw_date']}. "
+        res = run_etl(on_line=print, fourd=not args.no_4d)
+        print(f"\nTOTO: {res['added']} new draw(s); {res['n_draws']} draws up to {res['last_draw_date']}. "
               f"Model updated: {res['model_updated']}. Next move updated: {res['next_move_updated']}.")
-        return 0 if res["ok"] else 1
+        f = res["fourd"]
+        if f["ok"] is not None:
+            print(f"4D:   {f['added']} new draw(s); {f['n_draws']} draws up to {f['last_draw_date']}.")
+        print(f"Database: {res['db']['path']} {res['db']['draws']}")
+        return 0 if res["ok"] and f["ok"] is not False else 1
+
+    if args.cmd == "db":
+        from . import db
+        print(f"{db.DB_PATH}: {db.sync_all()}")
+        print(db.table_counts().to_string(index=False))
+        return 0
 
     from . import store
+    if args.cmd == "fourd-sets":
+        from .fourd_inspired import LABEL, predict
+        r = predict(store.load_store())
+        if not r["ok"]:
+            print(r["reason"])
+            return 1
+        print(f"{LABEL} sets from 4D draws: " + ", ".join(
+            f"{x['draw_date']} ({x['first']} {x['second']} {x['third']})" for x in r["based_on_4d"]) + "\n")
+        for s in r["sets"]:
+            print(f"#{s['rank']:<4}{'  '.join(f'{n:>2}' for n in s['numbers'])}")
+        b = r["backtest"]
+        if b["n_draws"]:
+            print(f"\nBacktest on {b['n_draws']} past draws (each using only the 4D draws before it):")
+            print(f"  set #1 hits per draw   {b['set1_hits_avg']:.2f}   random {b['set_hits_expected']:.2f}")
+            print(f"  pool of 18 hits        {b['pool_hits_avg']:.2f}   random {b['pool_hits_expected']:.2f}")
+            print(f"  pool had 3+ winners    {b['pool_3plus']:.0%}    random {b['pool_3plus_expected']:.0%}")
+        return 0
     if args.cmd == "add":
         from datetime import date
         try:
@@ -58,7 +91,9 @@ def main(argv=None) -> int:
         except ValueError as e:
             print("Not added:", e)
             return 1
-        print(f"Added. Store now has {len(draws)} draws ({store.STORE_PATH}).")
+        from .db import sync_toto
+        sync_toto()
+        print(f"Added. Store now has {len(draws)} draws ({store.STORE_PATH}, database updated).")
         return 0
 
     from .artifact import DEFAULT_ARTIFACT_DIR, load_artifact, predict_next
